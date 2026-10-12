@@ -1,0 +1,217 @@
+diff --git a/src-tauri/Cargo.lock b/src-tauri/Cargo.lock
+index 91fbadf21..639592858 100644
+--- a/src-tauri/Cargo.lock
++++ b/src-tauri/Cargo.lock
+@@ -113,7 +113,7 @@ checksum = "25bdb32cbbdce2b519a9cd7df3a678443100e265d5e25ca763b7572a5104f5f3"
+ 
+ [[package]]
+ name = "app"
+-version = "0.1.0"
++version = "0.3.1"
+ dependencies = [
+  "async-std",
+  "blocking",
+diff --git a/src/behaviors/behaviorBindingUtils.tsx b/src/behaviors/behaviorBindingUtils.tsx
+new file mode 100644
+index 000000000..1f58baec7
+--- /dev/null
++++ b/src/behaviors/behaviorBindingUtils.tsx
+@@ -0,0 +1,66 @@
++import { HidUsageLabel } from "../keyboard/HidUsageLabel";
++import { BehaviorBindingParametersSet, BehaviorParameterValueDescription } from "@zmkfirmware/zmk-studio-ts-client/behaviors";
++import { validateValue } from "./parameters";
++
++/**
++ * Find the matching parameter set based on param1 value.
++ * This is critical for determining param2 type, as param2's type can depend on param1's value.
++ */
++export function findMatchingParameterSet(
++  param1: number | undefined,
++  metadata: BehaviorBindingParametersSet[],
++  layerIds: number[]
++): BehaviorBindingParametersSet | undefined {
++  return metadata.find(set => validateValue(layerIds, param1, set.param1));
++}
++
++/**
++ * Get a readable display for a parameter value based on its metadata.
++ * Returns a JSX element, string, number, or null if nothing should be displayed.
++ * Returns null when the parameter shouldn't be displayed (empty metadata or nil type).
++ */
++export function getParameterDisplay(
++  value: number,
++  paramDescriptions: BehaviorParameterValueDescription[],
++  layers?: { id: number; name: string }[]
++): JSX.Element | string | number | null {
++  // If no parameter descriptions, don't display anything (matches ParameterValuePicker behavior)
++  if (!paramDescriptions || paramDescriptions.length === 0) {
++    return null;
++  }
++
++  // Check if it's a constant with a name
++  if (paramDescriptions.every(v => v.constant !== undefined)) {
++    const match = paramDescriptions.find(v => v.constant === value);
++    if (match?.name) {
++      return match.name;
++    }
++    // If no match found in constants, don't display
++    return null;
++  }
++
++  // For single parameter descriptions, check the type
++  if (paramDescriptions.length === 1) {
++    const desc = paramDescriptions[0];
++
++    if (desc.hidUsage) {
++      return <HidUsageLabel hid_usage={value}/>;
++    }
++
++    if (desc.layerId && layers) {
++      // Look up the layer name by ID
++      const layer = layers.find(l => l.id === value);
++      return layer?.name || `Layer ${value}`;
++    }
++
++    if (desc.range) {
++      return value;
++    }
++
++    // If it's a nil type or unrecognized, don't display
++    return null;
++  }
++
++  // For multiple parameter descriptions or unhandled cases, don't display
++  return null;
++}
+diff --git a/src/keyboard/Key.tsx b/src/keyboard/Key.tsx
+index 8944e00c7..eab56463d 100644
+--- a/src/keyboard/Key.tsx
++++ b/src/keyboard/Key.tsx
+@@ -53,6 +53,7 @@ export const Key = ({
+       style={{
+         width: `${pixelWidth}px`,
+         height: `${pixelHeight}px`,
++        lineHeight: 1,
+       }}
+       onClick={onClick}
+     >
+diff --git a/src/keyboard/Keymap.tsx b/src/keyboard/Keymap.tsx
+index a23563d65..8220defc2 100644
+--- a/src/keyboard/Keymap.tsx
++++ b/src/keyboard/Keymap.tsx
+@@ -8,7 +8,7 @@ import {
+   LayoutZoom,
+   PhysicalLayout as PhysicalLayoutComp,
+ } from "./PhysicalLayout";
+-import { HidUsageLabel } from "./HidUsageLabel";
++import { getBindingChildren } from "./KeymapBindingChildren";
+ 
+ type BehaviorMap = Record<number, GetBehaviorDetailsResponse>;
+ 
+@@ -48,11 +48,17 @@ export const Keymap = ({
+       };
+     }
+ 
++    const binding = keymap.layers[selectedLayerIndex].bindings[i];
++    const behavior = behaviors[binding.behaviorId];
++
++    // Get layers for metadata-driven rendering
++    const layers = keymap.layers.map(layer => ({ id: layer.id, name: layer.name }));
++
++    const children = getBindingChildren(behavior, binding, layers);
++
+     return {
+       id: `${keymap.layers[selectedLayerIndex].id}-${i}`,
+-      header:
+-        behaviors[keymap.layers[selectedLayerIndex].bindings[i].behaviorId]
+-          ?.displayName || "Unknown",
++      header: behavior?.displayName || "Unknown",
+       x: k.x / 100.0,
+       y: k.y / 100.0,
+       width: k.width / 100,
+@@ -60,11 +66,7 @@ export const Keymap = ({
+       r: (k.r || 0) / 100.0,
+       rx: (k.rx || 0) / 100.0,
+       ry: (k.ry || 0) / 100.0,
+-      children: (
+-        <HidUsageLabel
+-          hid_usage={keymap.layers[selectedLayerIndex].bindings[i].param1}
+-        />
+-      ),
++      children,
+     };
+   });
+ 
+diff --git a/src/keyboard/KeymapBindingChildren.tsx b/src/keyboard/KeymapBindingChildren.tsx
+new file mode 100644
+index 000000000..acb6afb0c
+--- /dev/null
++++ b/src/keyboard/KeymapBindingChildren.tsx
+@@ -0,0 +1,67 @@
++import { GetBehaviorDetailsResponse } from "@zmkfirmware/zmk-studio-ts-client/behaviors";
++import { findMatchingParameterSet, getParameterDisplay } from "../behaviors/behaviorBindingUtils";
++
++export interface KeyBinding {
++  param1: number;
++  param2: number;
++}
++
++export const getBindingChildren = (
++  behavior: GetBehaviorDetailsResponse | undefined,
++  binding: KeyBinding,
++  layers: { id: number; name: string }[] = []
++): JSX.Element | JSX.Element[] => {
++  // If no behavior metadata, try to show behavior name
++  if (!behavior || !behavior.metadata) {
++    return (
++      <div className="relative text-xs opacity-50">
++        {behavior?.displayName || ""}
++      </div>
++    );
++  }
++
++  // Find the matching parameter set for param1 (critical for getting param2 type)
++  const layerIds = layers.map(l => l.id);
++  const matchingSet = findMatchingParameterSet(binding.param1, behavior.metadata, layerIds);
++
++  // Get displays for both parameters
++  const param1Display = 
++    getParameterDisplay(binding.param1, behavior.metadata.flatMap(m => m.param1), layers);
++
++  const param2Display = matchingSet ?
++    getParameterDisplay(binding.param2, matchingSet.param2, layers) :
++    null;
++
++  // Both parameters present and should be displayed
++  if (param1Display !== null && param2Display !== null) {
++    return [
++      <div key="p2" className="relative text-s">
++        {param2Display}
++      </div>,
++      <div key="p1" className="relative text-xs ml-1 mt-2">
++        {param1Display}
++      </div>
++    ];
++  }
++
++  // Only param1 should be displayed
++  if (param1Display !== null) {
++    return (
++      <div className="relative text-base">
++        {param1Display}
++      </div>
++    );
++  }
++
++  // Only param2 should be displayed (unusual but handle it)
++  if (param2Display !== null) {
++    return (
++      <div className="relative text-base">
++        {param2Display}
++      </div>
++    );
++  }
++
++  // Nothing to display
++  return <div className="relative"></div>;
++};
