@@ -1,0 +1,908 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index e09ed0c..31e0498 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -27,6 +27,15 @@ import { LockStateContext } from "./rpc/LockStateContext";
+ import { UnlockModal } from "./UnlockModal";
+ import { valueAfter } from "./misc/async";
+ import { AppFooter } from "./AppFooter";
++import {
++  downloadTextFile,
++  errorText,
++  fetchKeymapAndBehaviors,
++  pickTextFile,
++  sanitizeFileName,
++} from "./keymap/keymapFileIO";
++import { toPortableKeymap, parsePortableKeymap } from "./keymap/portableKeymap";
++import { applyPortableKeymap } from "./keymap/applyPortableKeymap";
+ import { AboutModal } from "./AboutModal";
+ import { LicenseNoticeModal } from "./misc/LicenseNoticeModal";
+ 
+@@ -271,6 +280,88 @@ function App() {
+     doDisconnect();
+   }, [conn]);
+ 
++  const isUnlocked =
++    lockState === LockState.ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
++
++  const exportKeymap = useCallback(() => {
++    async function doExport() {
++      if (!conn.conn) {
++        return;
++      }
++      if (!isUnlocked) {
++        window.alert("Unlock the keyboard in Studio before exporting.");
++        return;
++      }
++
++      try {
++        const { keymap, behaviors } = await fetchKeymapAndBehaviors(conn.conn);
++        const portable = toPortableKeymap(keymap, behaviors);
++        const doc = {
++          ...portable,
++          deviceName: connectedDeviceName ?? "unknown",
++          exportedAt: new Date().toISOString(),
++        };
++
++        const base =
++          sanitizeFileName(connectedDeviceName || "zmk") || "zmk";
++        downloadTextFile(
++          `${base}-keymap.json`,
++          JSON.stringify(doc, null, 2)
++        );
++      } catch (e) {
++        window.alert(
++          `Export failed: ${errorText(e, "Could not export the keymap")}`
++        );
++      }
++    }
++
++    doExport();
++  }, [conn, connectedDeviceName, isUnlocked]);
++
++  const importKeymap = useCallback(() => {
++    async function doImport() {
++      if (!conn.conn) {
++        return;
++      }
++      if (!isUnlocked) {
++        window.alert("Unlock the keyboard in Studio before importing.");
++        return;
++      }
++
++      const picked = await pickTextFile();
++      if (!picked) {
++        return;
++      }
++
++      try {
++        const portable = parsePortableKeymap(picked.text);
++        const { behaviors } = await fetchKeymapAndBehaviors(conn.conn);
++
++        const confirmed = window.confirm(
++          `Replace the keyboard layout with "${picked.name}"?\n\n` +
++            `The layers from the file are written to the keyboard and saved. ` +
++            `You can still use "Restore Stock Settings" to go back to the stock layout.`
++        );
++        if (!confirmed) {
++          return;
++        }
++
++        await applyPortableKeymap(conn.conn, portable, behaviors, {
++          save: true,
++        });
++      } catch (e) {
++        window.alert(
++          `Import failed: ${errorText(e, "Could not import the keymap")}`
++        );
++      } finally {
++        reset();
++        setConn({ conn: conn.conn });
++      }
++    }
++
++    doImport();
++  }, [conn, isUnlocked, reset]);
++
+   const onConnect = useCallback(
+     (t: RpcTransport) => {
+       const ac = new AbortController();
+@@ -306,6 +397,8 @@ function App() {
+               onDiscard={discard}
+               onDisconnect={disconnect}
+               onResetSettings={resetSettings}
++              onExportKeymap={exportKeymap}
++              onImportKeymap={importKeymap}
+             />
+             <Keyboard />
+             <AppFooter
+diff --git a/src/AppHeader.tsx b/src/AppHeader.tsx
+index 52a6658..fa4d5c9 100644
+--- a/src/AppHeader.tsx
++++ b/src/AppHeader.tsx
+@@ -12,7 +12,7 @@ import { useModalRef } from "./misc/useModalRef";
+ import { LockStateContext } from "./rpc/LockStateContext";
+ import { LockState } from "@zmkfirmware/zmk-studio-ts-client/core";
+ import { ConnectionContext } from "./rpc/ConnectionContext";
+-import { ChevronDown, Undo2, Redo2, Save, Trash2 } from "lucide-react";
++import { ChevronDown, Undo2, Redo2, Save, Trash2, Download, Upload } from "lucide-react";
+ import { Tooltip } from "./misc/Tooltip";
+ import { GenericModal } from "./GenericModal";
+ 
+@@ -24,6 +24,8 @@ export interface AppHeaderProps {
+   onRedo?: () => Promise<void>;
+   onResetSettings?: () => void | Promise<void>;
+   onDisconnect?: () => void | Promise<void>;
++  onExportKeymap?: () => void | Promise<void>;
++  onImportKeymap?: () => void | Promise<void>;
+   canUndo?: boolean;
+   canRedo?: boolean;
+ }
+@@ -38,6 +40,8 @@ export const AppHeader = ({
+   onDiscard,
+   onDisconnect,
+   onResetSettings,
++  onExportKeymap,
++  onImportKeymap,
+ }: AppHeaderProps) => {
+   const [showSettingsReset, setShowSettingsReset] = useState(false);
+ 
+@@ -67,7 +71,11 @@ export const AppHeader = ({
+   return (
+     <header className="top-0 left-0 right-0 grid grid-cols-[1fr_auto_1fr] items-center justify-between h-10 max-w-full">
+       <div className="flex px-3 items-center gap-1">
+-        <img src="/zmk.svg" alt="ZMK Logo" className="h-8 rounded" />
++        <img
++          src={`${import.meta.env.BASE_URL}zmk.svg`}
++          alt="ZMK Logo"
++          className="h-8 rounded"
++        />
+         <p>Studio</p>
+       </div>
+       <GenericModal ref={showSettingsRef} className="max-w-[50vw]">
+@@ -164,6 +172,28 @@ export const AppHeader = ({
+             <Trash2 className="inline-block w-4 mx-1" aria-label="Discard" />
+           </Button>
+         </Tooltip>
++        {onExportKeymap && (
++          <Tooltip label="Export keymap to a JSON file">
++            <Button
++              className="flex items-center justify-center p-1.5 rounded enabled:hover:bg-base-300 disabled:opacity-50"
++              isDisabled={!connectedDeviceLabel}
++              onPress={onExportKeymap}
++            >
++              <Download className="inline-block w-4 mx-1" aria-label="Export keymap" />
++            </Button>
++          </Tooltip>
++        )}
++        {onImportKeymap && (
++          <Tooltip label="Import keymap from a JSON file">
++            <Button
++              className="flex items-center justify-center p-1.5 rounded enabled:hover:bg-base-300 disabled:opacity-50"
++              isDisabled={!connectedDeviceLabel}
++              onPress={onImportKeymap}
++            >
++              <Upload className="inline-block w-4 mx-1" aria-label="Import keymap" />
++            </Button>
++          </Tooltip>
++        )}
+       </div>
+     </header>
+   );
+diff --git a/src/DownloadPage.tsx b/src/DownloadPage.tsx
+index 19e01d7..7effc6d 100644
+--- a/src/DownloadPage.tsx
++++ b/src/DownloadPage.tsx
+@@ -115,7 +115,11 @@ export const Download = () => {
+ 
+   return (
+     <div className="bg-base-200 dark:bg-base-300 text-base-content min-h-full w-full flex flex-col justify-center items-center p-10 pb-48">
+-      <img src="/zmk-mac-app-icon.webp" alt="ZMK Studio" className="w-64" />
++      <img
++        src={`${import.meta.env.BASE_URL}zmk-mac-app-icon.webp`}
++        alt="ZMK Studio"
++        className="w-64"
++      />
+       <div className="text-3xl mb-1">ZMK Studio</div>
+       <div className="text-md mb-1 opacity-70">
+         {ReleaseVersion}
+diff --git a/src/index.css b/src/index.css
+index 3432b94..44cbb34 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -5,7 +5,7 @@
+ @layer base {
+   @font-face {
+     font-family: "Inter";
+-    src: url("/Inter.woff2") format("woff2");
++    src: url("/zmk-studio-patched/Inter.woff2") format("woff2");
+     font-display: fallback;
+   }
+ }
+diff --git a/src/keymap/applyPortableKeymap.ts b/src/keymap/applyPortableKeymap.ts
+new file mode 100644
+index 0000000..2e3eb1f
+--- /dev/null
++++ b/src/keymap/applyPortableKeymap.ts
+@@ -0,0 +1,191 @@
++import type { RpcConnection } from "@zmkfirmware/zmk-studio-ts-client";
++import type { GetBehaviorDetailsResponse } from "@zmkfirmware/zmk-studio-ts-client/behaviors";
++import {
++  SetLayerBindingResponse,
++  SetLayerPropsResponse,
++  type BehaviorBinding,
++  type Keymap,
++} from "@zmkfirmware/zmk-studio-ts-client/keymap";
++import { call_rpc } from "../rpc/logging";
++import {
++  checkPortableKeymap,
++  resolvePortableBindings,
++  type PortableKeymap,
++} from "./portableKeymap";
++
++export class KeymapApplyError extends Error {
++  keymap?: Keymap;
++
++  constructor(message: string, keymap?: Keymap) {
++    super(message);
++    this.name = "KeymapApplyError";
++    this.keymap = keymap;
++  }
++}
++
++export async function applyPortableKeymap(
++  conn: RpcConnection,
++  portable: PortableKeymap,
++  behaviors: Record<number, GetBehaviorDetailsResponse>,
++  options: { save: boolean },
++): Promise<Keymap> {
++  let wrote = false;
++
++  try {
++    let working = await requireKeymap(conn);
++    checkPortableKeymap(portable, working, behaviors);
++
++    while (working.layers.length > portable.layers.length) {
++      wrote = true;
++      const layerIndex = working.layers.length - 1;
++      const resp = await call_rpc(conn, {
++        keymap: { removeLayer: { layerIndex } },
++      });
++      if (!resp?.keymap?.removeLayer?.ok) {
++        throw new KeymapApplyError(
++          `Failed to remove extra layer ${layerIndex + 1}`,
++        );
++      }
++      working = {
++        ...working,
++        layers: working.layers.slice(0, -1),
++        availableLayers: working.availableLayers + 1,
++      };
++    }
++
++    while (working.layers.length < portable.layers.length) {
++      wrote = true;
++      const resp = await call_rpc(conn, { keymap: { addLayer: {} } });
++      const added = resp?.keymap?.addLayer?.ok?.layer;
++      if (!added) {
++        throw new KeymapApplyError("Failed to add a layer");
++      }
++      working = {
++        ...working,
++        layers: [...working.layers, added],
++        availableLayers: Math.max(0, working.availableLayers - 1),
++      };
++    }
++
++    for (let i = 0; i < portable.layers.length; i++) {
++      const layer = working.layers[i];
++      const name = portable.layers[i].name;
++      if (layer.name === name) {
++        continue;
++      }
++      wrote = true;
++      const resp = await call_rpc(conn, {
++        keymap: { setLayerProps: { layerId: layer.id, name } },
++      });
++      if (
++        resp?.keymap?.setLayerProps !==
++        SetLayerPropsResponse.SET_LAYER_PROPS_RESP_OK
++      ) {
++        throw new KeymapApplyError(`Failed to rename layer ${i + 1}`);
++      }
++    }
++
++    const fresh = await requireKeymap(conn);
++    if (fresh.layers.length !== portable.layers.length) {
++      throw new KeymapApplyError(
++        "Keyboard layer count did not match the file after sync",
++      );
++    }
++
++    const positions = portable.layers[0]?.bindings.length ?? 0;
++    for (const layer of fresh.layers) {
++      if (layer.bindings.length !== positions) {
++        throw new KeymapApplyError("Keyboard key count changed during load");
++      }
++    }
++
++    const resolved = resolvePortableBindings(
++      portable,
++      behaviors,
++      fresh.layers.map((layer) => layer.id),
++    );
++
++    for (let i = 0; i < fresh.layers.length; i++) {
++      const layer = fresh.layers[i];
++      for (let key = 0; key < resolved[i].length; key++) {
++        const next = resolved[i][key];
++        const current = layer.bindings[key];
++        if (current && sameBinding(current, next)) {
++          continue;
++        }
++        wrote = true;
++        const resp = await call_rpc(conn, {
++          keymap: {
++            setLayerBinding: {
++              layerId: layer.id,
++              keyPosition: key,
++              binding: next,
++            },
++          },
++        });
++        if (
++          resp?.keymap?.setLayerBinding !==
++          SetLayerBindingResponse.SET_LAYER_BINDING_RESP_OK
++        ) {
++          throw new KeymapApplyError(
++            `Layer ${i + 1} key ${key + 1}: ${bindingError(resp?.keymap?.setLayerBinding)}`,
++          );
++        }
++      }
++    }
++
++    if (options.save) {
++      wrote = true;
++      const resp = await call_rpc(conn, { keymap: { saveChanges: true } });
++      const saved = resp?.keymap?.saveChanges;
++      if (!saved || saved.err) {
++        throw new KeymapApplyError("Failed to save keymap to the keyboard");
++      }
++    }
++
++    return await requireKeymap(conn);
++  } catch (error) {
++    if (!wrote) {
++      throw error;
++    }
++    let refreshed: Keymap | undefined;
++    try {
++      refreshed = await requireKeymap(conn);
++    } catch {
++      refreshed = undefined;
++    }
++    const message =
++      error instanceof Error ? error.message : "Failed to load keymap";
++    throw new KeymapApplyError(message, refreshed);
++  }
++}
++
++async function requireKeymap(conn: RpcConnection): Promise<Keymap> {
++  const resp = await call_rpc(conn, { keymap: { getKeymap: true } });
++  const keymap = resp?.keymap?.getKeymap;
++  if (!keymap?.layers) {
++    throw new KeymapApplyError("Failed to read keymap from keyboard");
++  }
++  return keymap;
++}
++
++function sameBinding(a: BehaviorBinding, b: BehaviorBinding): boolean {
++  return (
++    a.behaviorId === b.behaviorId &&
++    a.param1 === b.param1 &&
++    a.param2 === b.param2
++  );
++}
++
++function bindingError(code: SetLayerBindingResponse | undefined): string {
++  switch (code) {
++    case SetLayerBindingResponse.SET_LAYER_BINDING_RESP_INVALID_LOCATION:
++      return "keyboard rejected a key position";
++    case SetLayerBindingResponse.SET_LAYER_BINDING_RESP_INVALID_BEHAVIOR:
++      return "keyboard rejected a behavior";
++    case SetLayerBindingResponse.SET_LAYER_BINDING_RESP_INVALID_PARAMETERS:
++      return "keyboard rejected key parameters";
++    default:
++      return "keyboard rejected a key binding";
++  }
++}
+diff --git a/src/keymap/keymapFileIO.ts b/src/keymap/keymapFileIO.ts
+new file mode 100644
+index 0000000..07a0247
+--- /dev/null
++++ b/src/keymap/keymapFileIO.ts
+@@ -0,0 +1,110 @@
++import type { RpcConnection } from "@zmkfirmware/zmk-studio-ts-client";
++import type { GetBehaviorDetailsResponse } from "@zmkfirmware/zmk-studio-ts-client/behaviors";
++import type { Keymap } from "@zmkfirmware/zmk-studio-ts-client/keymap";
++import { call_rpc } from "../rpc/logging";
++
++export type BehaviorMap = Record<number, GetBehaviorDetailsResponse>;
++
++export interface StudioKeymapSnapshot {
++  keymap: Keymap;
++  behaviors: BehaviorMap;
++}
++
++/**
++ * Read the current keymap plus the full behavior table (id -> details) from the
++ * connected device. The behavior table is needed because bindings only carry a
++ * numeric `behaviorId`; the portable keymap file stores human readable names.
++ */
++export async function fetchKeymapAndBehaviors(
++  conn: RpcConnection
++): Promise<StudioKeymapSnapshot> {
++  const keymapResp = await call_rpc(conn, { keymap: { getKeymap: true } });
++  const keymap = keymapResp?.keymap?.getKeymap;
++  if (!keymap?.layers) {
++    throw new Error("Could not read the keymap from the device");
++  }
++
++  const listResp = await call_rpc(conn, {
++    behaviors: { listAllBehaviors: true },
++  });
++  const behaviorIds =
++    listResp?.behaviors?.listAllBehaviors?.behaviors || [];
++
++  const behaviors: BehaviorMap = {};
++  for (const behaviorId of behaviorIds) {
++    const detailsResp = await call_rpc(conn, {
++      behaviors: { getBehaviorDetails: { behaviorId } },
++    });
++    const details = detailsResp?.behaviors?.getBehaviorDetails;
++    if (details) {
++      behaviors[details.id] = details;
++    }
++  }
++
++  return { keymap, behaviors };
++}
++
++export function sanitizeFileName(name: string): string {
++  return name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
++}
++
++/** Trigger a browser download of a text file. */
++export function downloadTextFile(fileName: string, contents: string): void {
++  const blob = new Blob([contents], { type: "application/json" });
++  const url = URL.createObjectURL(blob);
++  const anchor = document.createElement("a");
++  anchor.href = url;
++  anchor.download = fileName;
++  document.body.appendChild(anchor);
++  anchor.click();
++  anchor.remove();
++  URL.revokeObjectURL(url);
++}
++
++/** Open the OS file picker and resolve with the chosen text file. */
++export function pickTextFile(
++  accept = ".json,application/json"
++): Promise<{ name: string; text: string } | undefined> {
++  return new Promise((resolve) => {
++    const input = document.createElement("input");
++    input.type = "file";
++    input.accept = accept;
++    input.style.position = "fixed";
++    input.style.left = "-1000px";
++    document.body.appendChild(input);
++
++    const cleanup = () => input.remove();
++
++    input.addEventListener("change", async () => {
++      const file = input.files?.[0];
++      cleanup();
++      if (!file) {
++        resolve(undefined);
++        return;
++      }
++      try {
++        resolve({ name: file.name, text: await file.text() });
++      } catch (e) {
++        console.error("Failed to read the selected file", e);
++        resolve(undefined);
++      }
++    });
++
++    input.addEventListener("cancel", () => {
++      cleanup();
++      resolve(undefined);
++    });
++
++    input.click();
++  });
++}
++
++export function errorText(error: unknown, fallback: string): string {
++  if (error instanceof Error && error.message) {
++    return error.message;
++  }
++  if (typeof error === "string" && error.length > 0) {
++    return error;
++  }
++  return fallback;
++}
+diff --git a/src/keymap/portableKeymap.ts b/src/keymap/portableKeymap.ts
+new file mode 100644
+index 0000000..510fe61
+--- /dev/null
++++ b/src/keymap/portableKeymap.ts
+@@ -0,0 +1,368 @@
++import type {
++  BehaviorBindingParametersSet,
++  BehaviorParameterValueDescription,
++  GetBehaviorDetailsResponse,
++} from "@zmkfirmware/zmk-studio-ts-client/behaviors";
++import type {
++  BehaviorBinding,
++  Keymap,
++} from "@zmkfirmware/zmk-studio-ts-client/keymap";
++import { hid_usage_page_and_id_from_usage } from "../hid-usages";
++import { validateValue } from "../behaviors/parameters";
++
++export const PORTABLE_KEYMAP_FORMAT = "zmk-studio-keymap";
++export const PORTABLE_KEYMAP_VERSION = 1;
++
++export type PortableParam = number | { layer: number };
++
++export interface PortableBinding {
++  behavior: string;
++  param1: PortableParam;
++  param2: PortableParam;
++}
++
++export interface PortableLayer {
++  name: string;
++  bindings: PortableBinding[];
++}
++
++export interface PortableKeymap {
++  format: typeof PORTABLE_KEYMAP_FORMAT;
++  version: typeof PORTABLE_KEYMAP_VERSION;
++  layers: PortableLayer[];
++}
++
++const MAX_UINT32 = 0xffffffff;
++
++export function isLayerRef(param: PortableParam): param is { layer: number } {
++  return typeof param === "object" && param !== null && "layer" in param;
++}
++
++export function toPortableKeymap(
++  keymap: Keymap,
++  behaviors: Record<number, GetBehaviorDetailsResponse>,
++): PortableKeymap {
++  const layerIds = keymap.layers.map((layer) => layer.id);
++
++  return {
++    format: PORTABLE_KEYMAP_FORMAT,
++    version: PORTABLE_KEYMAP_VERSION,
++    layers: keymap.layers.map((layer) => ({
++      name: layer.name,
++      bindings: layer.bindings.map((binding) => {
++        const behavior = behaviors[binding.behaviorId];
++        if (!behavior) {
++          throw new Error(
++            `Keyboard behavior ${binding.behaviorId} has no name`,
++          );
++        }
++        return encodeBinding(binding, behavior, layerIds);
++      }),
++    })),
++  };
++}
++
++export function parsePortableKeymap(text: string): PortableKeymap {
++  let data: unknown;
++  try {
++    data = JSON.parse(text);
++  } catch {
++    throw new Error("Keymap file is not valid JSON");
++  }
++
++  if (!isRecord(data)) {
++    throw new Error("Keymap file must be a JSON object");
++  }
++  if (data.format !== PORTABLE_KEYMAP_FORMAT) {
++    throw new Error('Keymap file format must be "zmk-studio-keymap"');
++  }
++  if (data.version !== PORTABLE_KEYMAP_VERSION) {
++    throw new Error("Keymap file version must be 1");
++  }
++  if (!Array.isArray(data.layers) || data.layers.length === 0) {
++    throw new Error("Keymap file has no layers");
++  }
++
++  return {
++    format: PORTABLE_KEYMAP_FORMAT,
++    version: PORTABLE_KEYMAP_VERSION,
++    layers: data.layers.map((layer, index) => parseLayer(layer, index)),
++  };
++}
++
++export function checkPortableKeymap(
++  portable: PortableKeymap,
++  keymap: Keymap,
++  behaviors: Record<number, GetBehaviorDetailsResponse>,
++): void {
++  if (keymap.layers.length < 1) {
++    throw new Error("Keyboard has no layers");
++  }
++
++  const positions = keymap.layers[0].bindings.length;
++  const extra = portable.layers.length - keymap.layers.length;
++  if (extra > keymap.availableLayers) {
++    const room = keymap.layers.length + keymap.availableLayers;
++    throw new Error(
++      `Keymap file has ${portable.layers.length} layers, keyboard only has room for ${room}`,
++    );
++  }
++
++  const byName = behaviorsByName(behaviors);
++
++  portable.layers.forEach((layer, layerIndex) => {
++    if (
++      keymap.maxLayerNameLength > 0 &&
++      layer.name.length > keymap.maxLayerNameLength
++    ) {
++      throw new Error(
++        `Layer ${layerIndex + 1} name is longer than ${keymap.maxLayerNameLength} characters`,
++      );
++    }
++    if (layer.bindings.length !== positions) {
++      throw new Error(
++        `Layer ${layerIndex + 1} has ${layer.bindings.length} keys, keyboard has ${positions}`,
++      );
++    }
++
++    layer.bindings.forEach((binding, keyIndex) => {
++      const behavior = byName.get(binding.behavior);
++      if (!behavior) {
++        throw new Error(
++          `Layer ${layerIndex + 1} key ${keyIndex + 1} uses unknown behavior "${binding.behavior}"`,
++        );
++      }
++      checkLayerRef(
++        binding.param1,
++        "param1",
++        behavior,
++        portable.layers.length,
++        layerIndex,
++        keyIndex,
++      );
++      checkLayerRef(
++        binding.param2,
++        "param2",
++        behavior,
++        portable.layers.length,
++        layerIndex,
++        keyIndex,
++      );
++    });
++  });
++}
++
++export function resolvePortableBindings(
++  portable: PortableKeymap,
++  behaviors: Record<number, GetBehaviorDetailsResponse>,
++  layerIds: number[],
++): BehaviorBinding[][] {
++  const byName = behaviorsByName(behaviors);
++
++  return portable.layers.map((layer, layerIndex) =>
++    layer.bindings.map((binding, keyIndex) => {
++      const behavior = byName.get(binding.behavior);
++      if (!behavior) {
++        throw new Error(
++          `Layer ${layerIndex + 1} key ${keyIndex + 1} uses unknown behavior "${binding.behavior}"`,
++        );
++      }
++      return {
++        behaviorId: behavior.id,
++        param1: resolveParam(binding.param1, layerIds, layerIndex, keyIndex),
++        param2: resolveParam(binding.param2, layerIds, layerIndex, keyIndex),
++      };
++    }),
++  );
++}
++
++function encodeBinding(
++  binding: BehaviorBinding,
++  behavior: GetBehaviorDetailsResponse,
++  layerIds: number[],
++): PortableBinding {
++  const set = behavior.metadata.find((metadata) =>
++    validateValue(layerIds, binding.param1, metadata.param1),
++  );
++
++  return {
++    behavior: behavior.displayName,
++    param1: encodeParam(set?.param1, binding.param1, layerIds),
++    param2: encodeParam(set?.param2, binding.param2, layerIds),
++  };
++}
++
++function encodeParam(
++  descriptions: BehaviorParameterValueDescription[] | undefined,
++  value: number,
++  layerIds: number[],
++): PortableParam {
++  const match = descriptions?.find((description) =>
++    valueMatches(description, value, layerIds),
++  );
++  if (match?.layerId) {
++    const index = layerIds.indexOf(value);
++    if (index >= 0) {
++      return { layer: index };
++    }
++  }
++  return value;
++}
++
++function valueMatches(
++  description: BehaviorParameterValueDescription,
++  value: number,
++  layerIds: number[],
++): boolean {
++  if (description.constant !== undefined) {
++    return description.constant == value;
++  }
++  if (description.range) {
++    return value >= description.range.min && value <= description.range.max;
++  }
++  if (description.hidUsage) {
++    const [page, id] = hid_usage_page_and_id_from_usage(value);
++    return page !== 0 && id !== 0;
++  }
++  if (description.layerId) {
++    return layerIds.includes(value);
++  }
++  if (description.nil) {
++    return value === 0;
++  }
++  return false;
++}
++
++function resolveParam(
++  param: PortableParam,
++  layerIds: number[],
++  layerIndex: number,
++  keyIndex: number,
++): number {
++  if (!isLayerRef(param)) {
++    return param;
++  }
++  const id = layerIds[param.layer];
++  if (id === undefined) {
++    throw new Error(
++      `Layer ${layerIndex + 1} key ${keyIndex + 1} points at layer ${param.layer}`,
++    );
++  }
++  return id;
++}
++
++function checkLayerRef(
++  param: PortableParam,
++  label: "param1" | "param2",
++  behavior: GetBehaviorDetailsResponse,
++  layerCount: number,
++  layerIndex: number,
++  keyIndex: number,
++): void {
++  if (!isLayerRef(param)) {
++    return;
++  }
++  if (
++    !Number.isInteger(param.layer) ||
++    param.layer < 0 ||
++    param.layer >= layerCount
++  ) {
++    throw new Error(
++      `Layer ${layerIndex + 1} key ${keyIndex + 1} ${label} points at layer ${param.layer}, file has ${layerCount} layers`,
++    );
++  }
++  if (!acceptsLayerId(behavior.metadata, label)) {
++    throw new Error(
++      `Layer ${layerIndex + 1} key ${keyIndex + 1} ${label} is a layer reference, but "${behavior.displayName}" does not take a layer`,
++    );
++  }
++}
++
++function acceptsLayerId(
++  metadata: BehaviorBindingParametersSet[],
++  which: "param1" | "param2",
++): boolean {
++  return metadata.some((set) =>
++    (set[which] ?? []).some((description) => description.layerId !== undefined),
++  );
++}
++
++function behaviorsByName(
++  behaviors: Record<number, GetBehaviorDetailsResponse>,
++): Map<string, GetBehaviorDetailsResponse> {
++  const byName = new Map<string, GetBehaviorDetailsResponse>();
++  for (const behavior of Object.values(behaviors)) {
++    if (byName.has(behavior.displayName)) {
++      throw new Error(`Two behaviors share the name "${behavior.displayName}"`);
++    }
++    byName.set(behavior.displayName, behavior);
++  }
++  return byName;
++}
++
++function parseLayer(value: unknown, index: number): PortableLayer {
++  if (!isRecord(value)) {
++    throw new Error(`Layer ${index + 1} must be an object`);
++  }
++  if (typeof value.name !== "string") {
++    throw new Error(`Layer ${index + 1} needs a name`);
++  }
++  if (!Array.isArray(value.bindings)) {
++    throw new Error(`Layer ${index + 1} needs bindings`);
++  }
++  return {
++    name: value.name,
++    bindings: value.bindings.map((binding, keyIndex) =>
++      parseBinding(binding, index, keyIndex),
++    ),
++  };
++}
++
++function parseBinding(
++  value: unknown,
++  layerIndex: number,
++  keyIndex: number,
++): PortableBinding {
++  const where = `Layer ${layerIndex + 1} key ${keyIndex + 1}`;
++  if (!isRecord(value)) {
++    throw new Error(`${where} must be an object`);
++  }
++  if (typeof value.behavior !== "string" || value.behavior.length === 0) {
++    throw new Error(`${where} needs a behavior name`);
++  }
++  return {
++    behavior: value.behavior,
++    param1: parseParam(value.param1, where, "param1"),
++    param2: parseParam(value.param2, where, "param2"),
++  };
++}
++
++function parseParam(
++  value: unknown,
++  where: string,
++  label: "param1" | "param2",
++): PortableParam {
++  if (typeof value === "number") {
++    if (!Number.isInteger(value) || value < 0 || value > MAX_UINT32) {
++      throw new Error(`${where} ${label} must be a non-negative integer`);
++    }
++    return value;
++  }
++  if (isRecord(value) && "layer" in value) {
++    if (
++      typeof value.layer !== "number" ||
++      !Number.isInteger(value.layer) ||
++      value.layer < 0
++    ) {
++      throw new Error(
++        `${where} ${label} layer index must be a non-negative integer`,
++      );
++    }
++    return { layer: value.layer };
++  }
++  throw new Error(`${where} ${label} must be a number or a layer index`);
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
